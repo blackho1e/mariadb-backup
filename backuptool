@@ -1,0 +1,164 @@
+#!/bin/bash
+# author : blackdole@naver.com
+# date : 2018/08/01
+
+set -e
+
+VERSION=v0.0.1
+SCRIPTNAME=$(basename $0)
+MYSQL_HOST="$MYSQL_PORT_3306_TCP_ADDR"
+MYSQL_PORT="$MYSQL_PORT_3306_TCP_PORT"
+MYSQL_USER="root"
+MYSQL_PASSWORD="$MYSQL_ENV_MYSQL_ROOT_PASSWORD"
+WORKDIR="/data"
+BACKUPDIR="$WORKDIR/backups"
+EXPIRE_DAYS=3
+EXTRADIR="$WORKDIR/extras"
+LOGDIR="$WORKDIR/logs"
+XTRABACKUP=mariabackup
+
+
+_echo() {
+  if [ -z $DEBUG ] ; then
+    if [ ! -z $2 ] ; then
+      echo $1 1>> $2
+    fi
+  else
+    echo $1
+  fi
+}
+
+usage() {
+  cat <<EOF
+$SCRIPTNAME $VERSION MariaDB 백업 Tool.
+Usage:
+    $SCRIPTNAME [<options>]
+Options:
+    -h : MySQL host (default: $MYSQL_HOST).
+    -u : MySQL 사용자 계정 (default: $MYSQL_USER).
+    -p : MySQL 계정 암호 (default: $MYSQL_PASSWORD).
+    -P : MySQL 포트 (default: $MYSQL_PORT).
+    -e : 백업 파일 보관기간 (default: $EXPIRE_DAYS일)
+    -w : 작업 폴더 (default: $WORKDIR)
+    -V : 상세한 정보 출력
+
+EOF
+}
+
+backup() {
+  echo "백업 시작"
+
+  HOURS=$(date +%H)
+
+  if [ ! -d $BACKUPDIR/$(date +%Y-%m-%d) ] ; then
+    mkdir -p $BACKUPDIR/$(date +%Y-%m-%d)
+  fi
+
+  if [ ! -d $LOGDIR/$(date +%Y-%m-%d) ] ; then
+    mkdir -p $LOGDIR/$(date +%Y-%m-%d)
+  fi
+
+  if [ ! -d $EXTRADIR/$(date +%Y-%m-%d) ] ; then
+    mkdir -p $EXTRADIR/$(date +%Y-%m-%d)
+  fi
+
+  if [ -f $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream.incomplete ] ; then
+    rm $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream.incomplete
+  fi
+
+  if [ -f $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream ] ; then
+    rm $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream
+  fi
+
+  if [ -f $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream.incomplete ] ; then
+    rm $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream.incomplete
+  fi
+
+  if [ -f $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream ] ; then
+    LAST_LOGFILE="$LOGDIR/$(date +%Y-%m-%d)/$(ls -tr $LOGDIR/$(date +%Y-%m-%d) | tail -1)"
+    if [ -f $LAST_LOGFILE ] ; then
+      to_lsn=$(tail -n 20 $LAST_LOGFILE | grep -E "The latest check point" | grep -Eo '[0-9]+')
+      if [ ! -z $to_lsn ] ; then
+        LASTLSN=$to_lsn
+      fi
+    fi
+    if [ -z $LASTLSN ] ; then
+      LASTLSN=$(cat $EXTRADIR/$(date +%Y-%m-%d)/xtrabackup_checkpoints | grep to_lsn | awk '{print $3}')
+    fi
+
+    _echo "LASTLSN: $LASTLSN"
+    if [ -z $LASTLSN ] ; then
+      echo "증분 백업 파일에 LSN 정보를 확인할 수 없습니다." 1>> $LOGDIR/$(date +%Y-%m-%d)/incremental-$HOURS.log
+      exit 1
+    fi
+    echo "증분 백업 실행"
+    echo "$XTRABACKUP $BACKUP_ARGS --incremental-lsn=$LASTLSN --incremental-history-name=$(date +%Y-%m-%d) --history=$(date +%Y-%m-%d) --target-dir=$BACKUPDIR/$(date +%Y-%m-%d) > $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream" 1>> $LOGDIR/$(date +%Y-%m-%d)/incremental-$HOURS.log
+    $XTRABACKUP $BACKUP_ARGS --incremental-lsn=$LASTLSN --history=$(date +%Y-%m-%d) --target-dir=$BACKUPDIR/$(date +%Y-%m-%d) > $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream.incomplete 2>> $LOGDIR/$(date +%Y-%m-%d)/incremental-$HOURS.log
+    _echo "mv $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream.incomplete $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream" $LOGDIR/$(date +%Y-%m-%d)/incremental-$HOURS.log
+    mv $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream.incomplete $BACKUPDIR/$(date +%Y-%m-%d)/incremental-$HOURS.xbstream
+  else
+    echo "전체 백업 실행"
+    echo "$XTRABACKUP $BACKUP_ARGS --extra-lsndir=$EXTRADIR/$(date +%Y-%m-%d) --history=$(date +%Y-%m-%d) --target-dir=$BACKUPDIR/$(date +%Y-%m-%d) > $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream" 1>> $LOGDIR/$(date +%Y-%m-%d)/full.log
+    $XTRABACKUP $BACKUP_ARGS --extra-lsndir="$EXTRADIR/$(date +%Y-%m-%d)" --history=$(date +%Y-%m-%d) --target-dir=$BACKUPDIR/$(date +%Y-%m-%d) > $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream.incomplete 2>> $LOGDIR/$(date +%Y-%m-%d)/full.log
+    _echo "mv $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream.incomplete $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream" $LOGDIR/$(date +%Y-%m-%d)/full.log
+    mv $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream.incomplete $BACKUPDIR/$(date +%Y-%m-%d)/full.xbstream
+  fi
+
+  echo "백업 끝"
+}
+
+parseargs() {
+  while getopts :h:u:p:P:e:w:V OPT; do
+    case $OPT in
+      h)
+        MYSQL_HOST=$OPTARG
+        ;;
+      u)
+        MYSQL_USER=$OPTARG
+        ;;
+      p)
+        MYSQL_PASSWORD=$OPTARG
+        ;;
+      P)
+        MYSQL_PORT=$OPTARG
+        ;;
+      e)
+        EXPIRE_DAYS=$OPTARG
+        ;;
+      w)
+        WORKDIR=$OPTARG
+        ;;
+      V)
+        DEBUG=1
+        ;;
+      *)
+        usage
+        exit 1;;
+    esac
+  done
+
+  if [ -z $MYSQL_PASSWORD ] ; then
+    usage
+    exit 1
+  fi
+  BACKUP_ARGS="--host=$MYSQL_HOST --port=$MYSQL_PORT --user=$MYSQL_USER --password=$MYSQL_PASSWORD --backup --safe-slave-backup --stream=xbstream --compress"
+  BACKUPDIR="$WORKDIR/backups"
+  EXTRADIR="$WORKDIR/extras"
+  LOGDIR="$WORKDIR/logs"
+}
+
+cleanup() {
+  for i in `seq 0 2`; do
+    d=$(($EXPIRE_DAYS + $i))
+    EXPIREDAY=$(date --date="$d days ago" +%Y-%m-%d)
+    DIRS=("$LOGDIR/$EXPIREDAY" "$EXTRADIR/$EXPIREDAY" "$BACKUPDIR/$EXPIREDAY")
+    for DIR in "${DIRS[@]}"; do
+      if [ -d $DIR ] ; then
+        rm -rf $DIR
+      fi
+    done
+  done
+}
+
+parseargs "$@";
+backup && cleanup
